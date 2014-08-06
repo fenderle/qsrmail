@@ -12,7 +12,7 @@ TARGET = TestApp
 TEMPLATE = app
 
 # uncomment the following line for static linking
-CONFIG += qsrmail_static
+#CONFIG += qsrmail_static
 include(../../qsrmail.pri)
 
 SOURCES += main.cpp\
