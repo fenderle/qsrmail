@@ -1,0 +1,524 @@
+/*****************************************************************************
+** QsrMail - a SMTP client library for Qt
+**
+** Copyright 2013-2014 Frank Enderle <frank.enderle@anamica.de>
+**
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
+**
+**    http://www.apache.org/licenses/LICENSE-2.0
+**
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
+** limitations under the License.
+*****************************************************************************/
+
+#include "qsrmailrenderer_p.h"
+#include "qsrmailmessage_p.h"
+
+#include "qsrmailbase64encoder.h"
+#include "qsrmailqpencoder.h"
+
+#include <QBuffer>
+#include <QMimeDatabase>
+#include <QStringBuilder>
+#include <QUuid>
+#include <QHostInfo>
+
+#include <QDebug>
+
+QT_BEGIN_NAMESPACE
+
+QsrMailRenderer::QsrMailRenderer(const QsrMailMessage &message,
+                                 QObject *parent) :
+    QObject(parent),
+    mMessage(message),
+    mMessageId(QsrMailMessagePrivate::constData(message)->messageId),
+    mChunkPointer(0),
+    mChunkSize(0),
+    mState(IdleState),
+    mDevice(0),
+    mDeviceOpenedByUs(false)
+{
+    /* create a message id if the message had non set */
+    if (mMessageId.isEmpty()) {
+        mMessageId = '<'
+                % QUuid::createUuid().toString().toUpper().toLatin1().mid(1, 36)
+                % '@'
+                % QHostInfo::localHostName().toLatin1()
+                % '>';
+    }
+}
+
+QsrMailRenderer::~QsrMailRenderer()
+{
+}
+
+QByteArray
+QsrMailRenderer::messageId() const
+{
+    return mMessageId;
+}
+
+const char *
+QsrMailRenderer::dataPointer() const
+{
+    return mChunkPointer;
+}
+
+int
+QsrMailRenderer::bytesAvailable() const
+{
+    return mChunkSize;
+}
+
+void
+QsrMailRenderer::advanceDataPointer(int bytes)
+{
+    /* shift pointer and adjust size of chunk */
+    mChunkPointer += bytes;
+    mChunkSize -= bytes;
+
+    if (mChunkSize <= 0) {
+        /* chunk has been completed - reset pointer and size */
+        mChunkPointer = 0;
+        mChunkSize = 0;
+
+        /* dequeue the processed chunk (might not exist on first call) */
+        if (!mBufferQueue.isEmpty())
+            mBufferQueue.dequeue();
+
+        /* acquire next chunk from queue (if queue is not empty yet) */
+        if (!mBufferQueue.isEmpty()) {
+            const QByteArray &head = mBufferQueue.head();
+            mChunkPointer = head.constData();
+            mChunkSize = head.size();
+            return;
+        }
+
+        /* no more data is available in the buffers. There are now two
+         * possible ways:
+         *
+         * - a device is open and we wait for more data to be delivered
+         *   via the readyRead() signal of the device
+         * - if there's no device open we trigger the FSM to continue
+         *   processing the message and generate more data, which will
+         *   eventually also end in EndOfMessageState
+         */
+        if (mDevice == 0) {
+            QMetaObject::invokeMethod(this, "processStates",
+                                      Qt::QueuedConnection);
+        }
+    }
+}
+
+bool
+QsrMailRenderer::atEnd() const
+{
+    return mState == FinishedState && mChunkSize == 0 && mBufferQueue.isEmpty();
+}
+
+bool
+QsrMailRenderer::isRunning() const
+{
+    return mState != IdleState && mState != FinishedState;
+}
+
+void
+QsrMailRenderer::renderMessage()
+{
+    /* the FSM must be Idle or Finished */
+    if (mState != IdleState && mState != FinishedState) {
+        qWarning("QsrMailMsgRendererPrivate::renderMessage: " \
+                 "ignoring call due to non-idle state");
+        return;
+    }
+
+    /* abort pending operations */
+    abort();
+
+    /* reset the state to IdleState and start processing */
+    mState = IdleState;
+    QMetaObject::invokeMethod(this, "processStates", Qt::QueuedConnection);
+}
+
+void
+QsrMailRenderer::abort()
+{
+    if (mDevice != 0)
+        detachDevice();
+
+    mBufferQueue.clear();
+    mChunkPointer = 0;
+    mChunkSize = 0;
+    mState = FinishedState;
+}
+
+void
+QsrMailRenderer::enqueue(const QByteArray &chunk)
+{
+    /* enqueue a byte array; init the chunk pointer if necessary */
+    mBufferQueue.enqueue(chunk);
+    if (mChunkPointer == 0) {
+        mChunkPointer = mBufferQueue.head().constData();
+        mChunkSize = mBufferQueue.head().size();
+    }
+}
+
+void
+QsrMailRenderer::enqueue(QIODevice *device)
+{
+    Q_ASSERT(device != 0 && mDevice == 0);
+
+    /* ensure the device is opened and readable */
+    mDeviceOpenedByUs = false;
+
+    /* make sure the device is open */
+    if (!device->isOpen()) {
+        if (!device->open(QIODevice::ReadOnly)) {
+            qWarning("QsrMailMsgRendererPrivate::enqueue(): " \
+                     "cannot open device");
+            return;
+        }
+
+        /* remember to close the device */
+        mDeviceOpenedByUs = true;
+    }
+
+    /* make sure the device is accessible */
+    if (!device->isReadable()) {
+        qWarning("QsrMailMsgRendererPrivate::enqueue(): " \
+                 "device is not readable");
+
+        if (mDeviceOpenedByUs)
+            device->close();
+        return;
+    }
+
+    /* device is valid - remember it */
+    mDevice = device;
+
+    /* connect reader */
+    connect(mDevice, SIGNAL(readyRead()), this, SLOT(readFromDevice()));
+
+    /* queue initial read */
+    QMetaObject::invokeMethod(this, "readFromDevice", Qt::QueuedConnection);
+}
+
+void
+QsrMailRenderer::detachDevice()
+{
+    /* disconnect us from the object */
+    mDevice->disconnect(this);
+
+    /* close the device if it was opened by us */
+    if (mDeviceOpenedByUs)
+        mDevice->close();
+
+    /* schedule delete if the object was allocated by us */
+    if (mDevice->parent() == this)
+        mDevice->deleteLater();
+
+    /* ... no longer processing a device */
+    mDevice = 0;
+    mDeviceOpenedByUs = false;
+}
+
+void
+QsrMailRenderer::readFromDevice()
+{
+    /* make sure the device is valid since the device might have
+     * been disposed meanwhile (eg. by abort())
+     */
+    if (mDevice == 0)
+        return;
+
+    bool queued = false;
+
+    /* read available data from device and enqueue it */
+    while (true) {
+        qint64 remaining = mDevice->bytesAvailable();
+
+        /* try to read past eof */
+        if (remaining <= 0)
+            remaining = 128*1024;
+
+        /* allocate buffer for the available data and read it */
+        QByteArray buffer(static_cast<int>(remaining), Qt::Uninitialized);
+        char *ptr = buffer.data();
+        qint64 read = 0;
+        while (remaining > 0) {
+            qint64 got = mDevice->read(ptr, remaining);
+
+            /* handle error */
+            if (got < 0) {
+                qWarning("QsrMailMessageBufferPrivate::readFromDevice(): " \
+                         "read error from device");
+                break;
+            }
+
+            /* no more data available? */
+            if (got == 0)
+                break;
+
+            /* adjust pointers, etc. */
+            remaining -= got;
+            read += got;
+            ptr += got;
+        }
+
+        /* bail if nothing could be read */
+        if (read == 0)
+            break;
+
+        /* adjust the buffer to actual size and queue it */
+        buffer.resize(static_cast<int>(read));
+        enqueue(buffer);
+        queued = true;
+    }
+
+    /* detach the device if all data has been read */
+    if (mDevice->atEnd())
+        detachDevice();
+
+    /* if there was anything buffered emit the signal */
+    if (queued)
+        emit chunkReady();
+}
+
+void
+QsrMailRenderer::processStates()
+{
+    const QsrMailMessagePrivate *p = QsrMailMessagePrivate::constData(mMessage);
+
+    forever {
+        switch (mState) {
+        case IdleState: {
+            /* create message headers */
+            QByteArray headers(p->cookHeaders().renderHeaders());
+
+            /* add mime version if parts exist */
+            if (!(p->multipart.isEmpty())) {
+                /* get pointer to multipart private data */
+                const QsrMailMimePartImpl *partP =
+                        QsrMailMimePartImpl::constData(p->multipart);
+
+                /* output mime version and multipart headers */
+                headers += "MIME-Version: 1.0\r\n"
+                        % partP->cookHeaders().renderHeaders()
+                        % "\r\n";
+                enqueue(headers);
+
+                /* put the multipart on the stack and branch to the
+                 * boundary processing
+                 */
+                mParents.push(StackFrame(partP));
+                mState = MimeBoundaryState;
+                break;
+            }
+
+            /* output end-of-header sig. */
+            headers += "\r\n";
+            enqueue(headers);
+
+            /* enqueue body or body device */
+            if (p->bodyDevice == 0)
+                enqueue(p->body);
+            else
+                enqueue(p->bodyDevice);
+
+            mState = FinishedState;
+            emit chunkReady();
+            return;
+        }
+
+        case MimeBoundaryState: {
+            /* if there're no more frames on the stack, the message
+             * is complete
+             */
+            if (mParents.isEmpty()) {
+                mState = FinishedState;
+                emit chunkReady();
+                return;
+            }
+
+            /* not all parts have been processed for this parent, so output
+             * a boundary. Note that the boundary() helper function takes
+             * care of formatting the boundary correctly depending on the
+             * parts position in the part list (that is first boundary, middle
+             * boundaries and last boundary calls act different)
+             */
+            enqueue(mParents.top().boundary());
+
+            if (mParents.top().atEnd()) {
+                /* no more parts in this list - cleanup and switch to
+                 * the next part
+                 */
+                mParents.pop();
+                if (!mParents.isEmpty())
+                    mParents.top().nextPart();
+
+                /* output next boundary */
+                mState = MimeBoundaryState;
+            } else {
+                /* output part header */
+                mState = MimePartState;
+            }
+            break;
+        }
+
+        case MimePartState: {
+            if (mParents.top().part->isMultipart) {
+                /* part is multipart -> push it to the stack */
+                const QsrMailMimePartImpl *multipartP =
+                        QsrMailMimePartImpl::constData(mParents.top().part->multipart);
+                mParents.push(StackFrame(multipartP));
+
+                /* setup multipart headers */
+                QByteArray headers(multipartP->cookHeaders().renderHeaders());
+                headers += "\r\n";
+                enqueue(headers);
+                mState = MimeBoundaryState;
+                break;
+            }
+
+            /* setup part data iterator */
+            const QsrMailMimePartImpl *partP =
+                    QsrMailMimePartImpl::constData(mParents.top().part->part);
+            mParents.top().nextPart();
+
+            /* get part headers */
+            QsrMailHeadersPrivate headerList(partP->cookHeaders());
+
+            /* ... and here comes the heavy lifting */
+
+            /* determine content type */
+            QByteArray contentType(headerList.value("Content-Type"));
+            if (contentType.isEmpty()) {
+                /* detect contentType using QMimeDatabase */
+                QMimeDatabase mimeDb;
+                QMimeType mimeType;
+
+                if (partP->bodyDevice == 0)
+                    mimeType = mimeDb.mimeTypeForData(partP->body);
+                else
+                    mimeType = mimeDb.mimeTypeForData(partP->bodyDevice);
+
+                /* extract content type - just convert it to latin1. this
+                 * should not be a problem since mime types are usually
+                 * US-ASCII
+                 */
+                contentType = mimeType.name().toLatin1();
+
+                /* fallback to RFC default if type cannot be determined */
+                if (contentType.isEmpty())
+                    contentType = "text/plain; charset=us-ascii";
+
+                /* override the Content-Type header */
+                headerList.setHeader("Content-Type", contentType);
+            }
+
+            /* determine encoder to use */
+            QsrMailMimePart::Encoder encoder = partP->encoder;
+
+            /* autodetect selects quoted printable for text class,
+             * base64 for everything else
+             */
+            if (encoder == QsrMailMimePart::AutoDetectEncoder) {
+                if (contentType.startsWith("text/"))
+                    encoder = QsrMailMimePart::QuotedPrintableEncoder;
+                else
+                    encoder = QsrMailMimePart::Base64Encoder;
+            }
+
+            /* override content transfer encoding based on selected encoder */
+            if (encoder == QsrMailMimePart::Base64Encoder) {
+                headerList.setHeader("Content-Transfer-Encoding",
+                                     "base64");
+            } else if (encoder == QsrMailMimePart::QuotedPrintableEncoder) {
+                headerList.setHeader("Content-Transfer-Encoding",
+                                     "quoted-printable");
+            }
+
+            /* render the headers for the part */
+            QByteArray headers(headerList.renderHeaders());
+            headers += "\r\n";
+            enqueue(headers);
+
+            /* enqueue depending on encoder */
+            if (encoder == QsrMailMimePart::PassthroughEncoder) {
+                /* passthrough encoder simply enqueues the data */
+                if (partP->bodyDevice == 0)
+                    enqueue(partP->body);
+                else
+                    enqueue(partP->bodyDevice);
+            } else {
+                /* if an encoder is requested it will wrap the original data
+                 * or device
+                 */
+
+                /* construct a base device, which is either the originally
+                 * supplied device or a QBuffer which wraps the QByteArray
+                 * holding the content data
+                 */
+                QIODevice *base = 0;
+                if (partP->bodyDevice == 0) {
+                    QBuffer *buffer = new QBuffer;
+                    buffer->setData(partP->body);
+                    base = buffer;
+                } else {
+                    base = partP->bodyDevice;
+                }
+
+                /* wrap the base device with the encoder - welcome to
+                 * the onion!
+                 */
+                QIODevice *wrapper = base;
+
+                switch (encoder) {
+                case QsrMailMimePart::Base64Encoder:
+                    wrapper = new QsrMailBase64Encoder(base, this);
+                    break;
+                case QsrMailMimePart::QuotedPrintableEncoder:
+                    wrapper = new QsrMailQpEncoder(base, this);
+                    break;
+
+                case QsrMailMimePart::AutoDetectEncoder:
+                case QsrMailMimePart::PassthroughEncoder:
+                    /* if this happens someone added a new encoder and forgot
+                     * to add it here or something is really wrong ;-)
+                     */
+                    qFatal("QsrMailMsgRendererPrivate::processState: " \
+                           "invalid encoder (encoder=%d)", encoder);
+                }
+
+                /* if base is a wrapped QByteArray set the wrapper
+                 * as parent so it gets cleaned up on delete of the
+                 * wrapper
+                 */
+                if (base != partP->bodyDevice)
+                    base->setParent(wrapper);
+
+                /* and FINALLY queue the wrapper */
+                enqueue(wrapper);
+            }
+
+            mState = MimeBoundaryState;
+            emit chunkReady();
+            return;
+        }
+
+        case FinishedState: {
+            /* FSM has ended - the message is now complete */
+            emit finished();
+            return;
+        }
+
+        }
+    }
+}
+
+QT_END_NAMESPACE

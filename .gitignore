@@ -1,0 +1,7 @@
+*.pro.user
+*.pro.user.*
+doxygen/internal/*
+!doxygen/internal/*.qch
+doxygen/public/*
+!doxygen/public/*.qch
+lib

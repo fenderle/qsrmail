@@ -1,0 +1,313 @@
+#ifndef QSRMAIL_MSGRENDERERPRIVATE_P_H
+#define QSRMAIL_MSGRENDERERPRIVATE_P_H
+
+/*****************************************************************************
+** QsrMail - a SMTP client library for Qt
+**
+** Copyright 2013-2014 Frank Enderle <frank.enderle@anamica.de>
+**
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
+**
+**    http://www.apache.org/licenses/LICENSE-2.0
+**
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
+** limitations under the License.
+*****************************************************************************/
+
+#include <QObject>
+#include <QQueue>
+#include <QStack>
+#include <QMimeDatabase>
+
+#include "qsrmailmessage.h"
+#include "qsrmailmimepartimpl_p.h"
+
+QT_BEGIN_NAMESPACE
+
+/*!
+ * \internal
+ * \class QsrMailRenderer "qsrmailrenderer_p.h"
+ * The message renderer is used to produce the wire data for a
+ * QsrMailMessage. It's optimized for non-copy and fast access, thus
+ * lacking LOTS of security checks. It's mostly based on pointers and
+ * tries to allocate buffers only once.
+ *
+ * The heart of the beast is a finite state machine (FSM) which handles
+ * all the internal logic. In particular this class assembles the
+ * correct wire data based on the mime data, meaning it produces all the
+ * headers, the boundaries and handles transfer encoding so the result is
+ * "wire ready".
+ *
+ * It works asynchronous and is loosely based on the buffer class Qt uses
+ * internally to buffer HTTP uploads. Like the Qt buffer class it uses a
+ * buffer queue which is filled by the state machine and read by the consumer
+ * (user of this class).
+ *
+ * For usage see QsrMailTransport which utilizes the class for message
+ * rendering.
+ *
+ * \note
+ * This class is not thread-safe
+ */
+
+class QsrMailRenderer : public QObject
+{
+    Q_OBJECT
+
+public:
+    /*!
+     * Construct a new message renderer engine, based on the supplied
+     * *message* and *parent*.
+     */
+    QsrMailRenderer(const QsrMailMessage &message,
+                    QObject *parent = 0);
+
+    /*!
+     * Default destructor.
+     */
+    ~QsrMailRenderer();
+
+    /*!
+     * The messageId of the message. This id is either directly copied
+     * from the message or generated upon construction of this instance.
+     * A messageId is required for proper identification amongst servers.
+     * The implementation creates an unique message id using the following
+     * scheme:
+     *
+     * <uuid@hostname>
+     *
+     * * uuid: a random uuid converted to upper case, stripped of the { } crap
+     * * hostname: the local hostname of the machine running the code
+     */
+    QByteArray messageId() const;
+
+    /*!
+     * A direct pointer to the current data chunk. Use bytesAvailable()
+     * to find the number of bytes which are safely available in the
+     * buffer. *DO NOT READ BEYOND THE END OF THE BUFFER*. Also be
+     * aware that the returned pointer might actually be null.
+     */
+    const char *dataPointer() const;
+
+    /*!
+     * Number of bytes available to read, starting at dataPointer().
+     */
+    int bytesAvailable() const;
+
+    /*!
+     * Advances the dataPointer() by the given number of bytes. If the
+     * end of the current buffer is reached exactly two things might happen:
+     *
+     * * if more data is available the next dataPointer()/bytesAvailable()
+     *   calls will return valid data to access this buffer.
+     * * if no more data is queued the FSM is kicked off to gather more
+     *   data. Upon more data is queued the chunkReady() signal will be
+     *   fired.
+     *
+     * \param bytes
+     * Number of bytes by which the dataPointer() should be advanced
+     */
+    void advanceDataPointer(int bytes);
+
+    /*!
+     * Returns true if end of data has been reached.
+     */
+    bool atEnd() const;
+
+    /*!
+     * Returns true if the state machine is running
+     */
+    bool isRunning() const;
+
+    /*!
+     * Start processing the message.
+     */
+    void renderMessage();
+
+    /*!
+     * Abort the render processing. No more signals will be emitted (not
+     * even the finished signal), the state machine jumps immediately to the
+     * finished state and all resources will be released (including queued
+     * buffers).
+     */
+    void abort();
+
+Q_SIGNALS:
+    /*!
+     * Emits when new data has been queued to the buffer.
+     */
+    void chunkReady();
+
+    /*!
+     * Emits when the message has been processed.
+     */
+    void finished();
+
+private:
+    /*!
+     * Put a chunk of binary data into the buffer queue.
+     *
+     * \param chunk
+     * The chunk to queue
+     */
+    void enqueue(const QByteArray &chunk);
+
+    /*!
+     * Put a whole IODevice into the buffer queue. The device is
+     * connected to the device reader an every read data chunk is
+     * queued directly into the buffer queue. When the device reaches
+     * EOF it is disconnected. The device will be auto opened if
+     * neccessary, in which case it is also auto closed.
+     *
+     * \param device
+     * the QIODevice to queue
+     */
+    void enqueue(QIODevice *device);
+
+    /*!
+     * Cleanup the internal device pointer for external data sources.
+     * This disconnects the event chain and makes sure the device is not
+     * left over if it was actually allocated by the renderer.
+     */
+    void detachDevice();
+
+private Q_SLOTS:
+    /*!
+     * Device reader for the currently active body/part device.
+     */
+    void readFromDevice();
+
+    /*!
+     * process the FSM
+     */
+    void processStates();
+
+private:
+    /*!
+     * Describe the states of the FSM which handles message assembly.
+     */
+    enum State {
+        IdleState,                  /*!< the FSM has not yet been started */
+        MimeBoundaryState,          /*!< device is a buffer to the boundary */
+        MimePartState,              /*!< device is a mimepart body device */
+        FinishedState               /*!< the FSM has ended */
+    };
+
+    /*!
+     * Helper class used to handle the stack for nested multiparts. This
+     * class also provides a few handy helper methods to make life a little
+     * easier.
+     */
+    struct StackFrame
+    {
+        /*!
+         * Default constructor
+         */
+        StackFrame() :
+            data(0) {}
+
+        /*!
+         * Construct a new StackFrame object based on a part implementation
+         * object.
+         *
+         * *d* is a pointer to the multiparts implementation instance. The
+         * object is *not* copied and it must be ensured that the pointer
+         * stays valid over the lifetime of this object.
+         */
+        StackFrame(const QsrMailMimePartImpl *d) :
+            data(d), part(d->parts.constBegin()) {}
+
+        /*!
+         * Advance the internal iterator to the next part of the
+         * multipart list.
+         */
+        inline void nextPart()
+        {
+            ++part;
+        }
+
+        /*!
+         * Return true if the the iterator has reached the end of
+         * the multipart list.
+         */
+        inline bool atEnd()
+        {
+            return part == data->parts.constEnd();
+        }
+
+        /*!
+         * Create a valid boundary depending on the boundary set in the
+         * multipart data and the position of the mime part in the
+         * multiparts part list. In detail this affects:
+         *
+         * * if the mime part is the first in the list a CRLF sequence
+         *   is prepended in order to terminate the header list which
+         *   preceeds the first boundary.
+         * * parts between the first and the last part just output the
+         *   boundary as usual
+         * * if the part is the last in the list the termination sequence
+         *   (-- at the end of the boundary) is added.
+         */
+        inline QByteArray boundary()
+        {
+            QByteArray result;
+
+            if (part != data->parts.constBegin()
+                    && (part-1)->isPart) {
+                result = "\r\n";
+            }
+
+            result += "--";
+            result += data->boundary;
+
+            if (part == data->parts.constEnd())
+                result += "--";
+
+            result += "\r\n";
+
+            return result;
+        }
+
+        /*! pointer to the multipart object, wrapped by this StackFrame */
+        const QsrMailMimePartImpl *data;
+
+        /*! the iterator in the partlist */
+        QList<QsrMailMimePartImpl::PartOrMultipart>::ConstIterator part;
+    };
+
+    /*! the message data object */
+    QsrMailMessage mMessage;
+
+    /*! the message id of the message */
+    QByteArray mMessageId;
+
+    /*! ring buffer with data chunks */
+    QQueue<QByteArray> mBufferQueue;
+
+    /*! pointer within the current buffer chunk */
+    const char *mChunkPointer;
+
+    /*! remaining (unread) size of the chunck */
+    int mChunkSize;
+
+    /*! the FSM state */
+    State mState;
+
+    /*! A stack containing the path to parents of the multiparts */
+    QStack<StackFrame> mParents;
+
+    /*! The current QIODevice (if any, might be null) */
+    QIODevice *mDevice;
+
+    /*! Flag which indicates that mDevice needs to be closed by us */
+    bool mDeviceOpenedByUs;
+};
+
+QT_END_NAMESPACE
+
+#endif // QSRMAIL_MSGRENDERERPRIVATE_P_H
